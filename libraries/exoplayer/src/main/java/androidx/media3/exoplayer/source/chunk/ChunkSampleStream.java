@@ -19,6 +19,7 @@ import static androidx.media3.common.util.Assertions.checkNotNull;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
+import android.os.Process;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
@@ -146,7 +147,7 @@ public class ChunkSampleStream<T extends ChunkSource>
     this.loadErrorHandlingPolicy = loadErrorHandlingPolicy;
     this.canReportInitialDiscontinuity = canReportInitialDiscontinuity;
     loader =
-        downloadExecutor != null ? new Loader(downloadExecutor) : new Loader("ChunkSampleStream");
+        downloadExecutor != null ? new Loader(downloadExecutor, Process.THREAD_PRIORITY_DEFAULT) : new Loader("ChunkSampleStream");
     nextChunkHolder = new ChunkHolder();
     mediaChunks = new ArrayList<>();
     readOnlyMediaChunks = Collections.unmodifiableList(mediaChunks);

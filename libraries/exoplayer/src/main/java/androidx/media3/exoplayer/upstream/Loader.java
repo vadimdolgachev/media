@@ -18,6 +18,7 @@ package androidx.media3.exoplayer.upstream;
 import static java.lang.Math.min;
 import static java.lang.annotation.ElementType.TYPE_USE;
 
+import android.os.Process;
 import android.annotation.SuppressLint;
 import android.os.Handler;
 import android.os.Looper;
@@ -43,6 +44,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Manages the background loading of {@link Loadable}s. */
 @UnstableApi
 public final class Loader implements LoaderErrorThrower {
+
+  private final int threadPriority;
 
   /** Thrown when an unexpected exception or error is encountered during loading. */
   public static final class UnexpectedLoaderException extends IOException {
@@ -232,21 +235,19 @@ public final class Loader implements LoaderErrorThrower {
    * @param threadNameSuffix A name suffix for the loader's thread. This should be the name of the
    *     component using the loader.
    */
-  public Loader(String threadNameSuffix) {
+  public Loader(String threadNameSuffix, int threadPriority) {
     this(
         /* downloadExecutor= */ ReleasableExecutor.from(
             Util.newSingleThreadExecutor(THREAD_NAME_PREFIX + threadNameSuffix),
-            ExecutorService::shutdown));
+            ExecutorService::shutdown), threadPriority);
   }
 
-  /**
-   * Constructs an instance.
-   *
-   * @param downloadExecutor A {@link ReleasableExecutor} to run the load task. The {@link
-   *     ReleasableExecutor} will be {@linkplain ReleasableExecutor#release() released} once the
-   *     loader no longer requires it for new load tasks.
-   */
-  public Loader(ReleasableExecutor downloadExecutor) {
+  public Loader(String threadNameSuffix) {
+    this(threadNameSuffix, Process.THREAD_PRIORITY_DEFAULT);
+  }
+
+  public Loader(ReleasableExecutor downloadExecutor, int threadPriority) {
+    this.threadPriority = threadPriority;
     this.downloadExecutor = downloadExecutor;
   }
 
@@ -295,7 +296,7 @@ public final class Loader implements LoaderErrorThrower {
     Looper looper = Assertions.checkStateNotNull(Looper.myLooper());
     fatalError = null;
     long startTimeMs = SystemClock.elapsedRealtime();
-    new LoadTask<>(looper, loadable, callback, defaultMinRetryCount, startTimeMs).start(0);
+    new LoadTask<>(looper, loadable, callback, defaultMinRetryCount, startTimeMs, threadPriority).start(0);
     return startTimeMs;
   }
 
@@ -367,6 +368,7 @@ public final class Loader implements LoaderErrorThrower {
 
     private final T loadable;
     private final long startTimeMs;
+    private final int threadPriority;
 
     @Nullable private Loader.Callback<T> callback;
     @Nullable private IOException currentError;
@@ -381,12 +383,14 @@ public final class Loader implements LoaderErrorThrower {
         T loadable,
         Loader.Callback<T> callback,
         int defaultMinRetryCount,
-        long startTimeMs) {
+        long startTimeMs,
+        int threadPriority) {
       super(looper);
       this.loadable = loadable;
       this.callback = callback;
       this.defaultMinRetryCount = defaultMinRetryCount;
       this.startTimeMs = startTimeMs;
+      this.threadPriority = threadPriority;
     }
 
     public void maybeThrowError(int minRetryCount) throws IOException {
@@ -447,6 +451,7 @@ public final class Loader implements LoaderErrorThrower {
           shouldLoad = !canceled;
           executorThread = Thread.currentThread();
         }
+        Process.setThreadPriority(threadPriority);
         if (shouldLoad) {
           TraceUtil.beginSection("load:" + loadable.getClass().getSimpleName());
           try {

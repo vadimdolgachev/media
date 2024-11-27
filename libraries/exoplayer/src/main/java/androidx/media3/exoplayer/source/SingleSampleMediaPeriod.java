@@ -15,6 +15,7 @@
  */
 package androidx.media3.exoplayer.source;
 
+import android.os.Process;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
@@ -95,8 +96,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     sampleStreams = new ArrayList<>();
     loader =
         downloadExecutor != null
-            ? new Loader(downloadExecutor)
-            : new Loader("SingleSampleMediaPeriod");
+            ? new Loader(downloadExecutor, Process.THREAD_PRIORITY_AUDIO)
+            : new Loader("SingleSampleMediaPeriod", Process.THREAD_PRIORITY_AUDIO);
   }
 
   public void release() {

@@ -19,6 +19,7 @@ import static androidx.media3.common.util.Assertions.checkNotNull;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
+import android.os.Process;
 import android.net.Uri;
 import android.os.Handler;
 import androidx.annotation.Nullable;
@@ -210,8 +211,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     this.suppressPrepareError = suppressPrepareError;
     loader =
         downloadExecutor != null
-            ? new Loader(downloadExecutor)
-            : new Loader("ProgressiveMediaPeriod");
+            ? new Loader(downloadExecutor, Process.THREAD_PRIORITY_AUDIO)
+            : new Loader("ProgressiveMediaPeriod", Process.THREAD_PRIORITY_AUDIO);
     this.progressiveMediaExtractor = progressiveMediaExtractor;
     this.singleSampleDurationUs = singleSampleDurationUs;
     loadCondition = new ConditionVariable();

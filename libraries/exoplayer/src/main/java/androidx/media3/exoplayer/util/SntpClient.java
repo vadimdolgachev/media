@@ -17,6 +17,7 @@ package androidx.media3.exoplayer.util;
 
 import static androidx.media3.common.util.Assertions.checkNotNull;
 
+import android.os.Process;
 import android.os.SystemClock;
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Nullable;
