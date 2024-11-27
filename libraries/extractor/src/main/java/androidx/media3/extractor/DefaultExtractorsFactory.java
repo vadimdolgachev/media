@@ -542,9 +542,7 @@ public final class DefaultExtractorsFactory implements ExtractorsFactory {
         break;
       case FileTypes.AVI:
         extractors.add(
-            new AviExtractor(
-                (textTrackTranscodingEnabled ? 0 : AviExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA),
-                subtitleParserFactory));
+            new AviExtractor());
         break;
       case FileTypes.PNG:
         extractors.add(new PngExtractor());

@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The Android Open Source Project
+ * Copyright (C) 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,23 +15,27 @@
  */
 package androidx.media3.extractor.avi;
 
-import androidx.media3.common.util.ParsableByteArray;
+import androidx.annotation.NonNull;
 
-/** Parses and contains the name from the STRN chunk. */
-/* package */ final class StreamNameChunk implements AviChunk {
+import java.nio.ByteBuffer;
 
-  public static StreamNameChunk parseFrom(ParsableByteArray body) {
-    return new StreamNameChunk(body.readString(body.bytesLeft()));
+/**
+ * Wrapper around the various StreamFormats
+ */
+public class StreamFormatBox extends ResidentBox {
+  public static final int STRF = 0x66727473; // strf
+
+  StreamFormatBox(ByteBuffer byteBuffer) {
+    super(STRF, byteBuffer);
   }
 
-  public final String name;
-
-  private StreamNameChunk(String name) {
-    this.name = name;
+  @NonNull
+  public VideoFormat getVideoFormat() {
+    return new VideoFormat(byteBuffer);
   }
 
-  @Override
-  public int getType() {
-    return AviExtractor.FOURCC_strn;
+  @NonNull
+  public AudioFormat getAudioFormat() {
+    return new AudioFormat(byteBuffer);
   }
 }

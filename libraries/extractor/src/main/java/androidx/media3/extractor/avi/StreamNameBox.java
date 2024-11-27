@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The Android Open Source Project
+ * Copyright (C) 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,27 @@
  */
 package androidx.media3.extractor.avi;
 
-/**
- * A chunk, as defined in the AVI spec.
- *
- * <p>See https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference.
- */
-/* package */ interface AviChunk {
 
-  /** Returns the chunk type fourcc. */
-  int getType();
+import java.nio.ByteBuffer;
+
+/**
+ * Box containing a human readable stream name
+ */
+public class StreamNameBox extends ResidentBox {
+  public static final int STRN = 0x6e727473; // strn
+
+  StreamNameBox(ByteBuffer byteBuffer) {
+    super(STRN,byteBuffer);
+  }
+
+  public String getName() {
+    int len = byteBuffer.capacity();
+    if (byteBuffer.get(len - 1) == 0) {
+      len -= 1;
+    }
+    final byte[] bytes = new byte[len];
+    byteBuffer.position(0);
+    byteBuffer.get(bytes);
+    return new String(bytes);
+  }
 }

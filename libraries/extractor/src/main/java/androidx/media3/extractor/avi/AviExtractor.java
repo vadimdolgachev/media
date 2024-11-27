@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The Android Open Source Project
+ * Copyright (C) 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,585 +15,671 @@
  */
 package androidx.media3.extractor.avi;
 
-import static java.lang.Math.max;
-import static java.lang.annotation.ElementType.TYPE_USE;
-
-import androidx.annotation.IntDef;
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.VisibleForTesting;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
-import androidx.media3.common.ParserException;
-import androidx.media3.common.util.Assertions;
 import androidx.media3.common.util.Log;
-import androidx.media3.common.util.ParsableByteArray;
-import androidx.media3.common.util.UnstableApi;
 import androidx.media3.extractor.Extractor;
 import androidx.media3.extractor.ExtractorInput;
 import androidx.media3.extractor.ExtractorOutput;
-import androidx.media3.extractor.NoOpExtractorOutput;
 import androidx.media3.extractor.PositionHolder;
 import androidx.media3.extractor.SeekMap;
 import androidx.media3.extractor.TrackOutput;
-import androidx.media3.extractor.text.SubtitleParser;
-import androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput;
 import java.io.IOException;
-import java.lang.annotation.Documented;
-import java.lang.annotation.Retention;
-import java.lang.annotation.RetentionPolicy;
-import java.lang.annotation.Target;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.List;
 
 /**
- * Extracts data from the AVI container format.
- *
- * <p>Spec: https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference.
+ * Extractor based on the official MicroSoft spec
+ * https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference
  */
-@UnstableApi
-public final class AviExtractor implements Extractor {
+public class AviExtractor implements Extractor {
+  //Minimum time between keyframes in the AviSeekMap
+  static final long MIN_KEY_FRAME_RATE_US = 2_000_000L;
+  static final long UINT_MASK = 0xffffffffL;
+  static final int USHORT_MASK = 0xffff;
+  private static final int RELOAD_MINIMUM_SEEK_DISTANCE = 256 * 1024;
 
-  private static final String TAG = "AviExtractor";
-
-  public static final int FOURCC_RIFF = 0x46464952;
-  public static final int FOURCC_AVI_ = 0x20495641; // AVI<space>
-  public static final int FOURCC_LIST = 0x5453494c;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_avih = 0x68697661;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_hdrl = 0x6c726468;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_strl = 0x6c727473;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_movi = 0x69766f6d;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_idx1 = 0x31786469;
-
-  public static final int FOURCC_JUNK = 0x4b4e554a;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_strf = 0x66727473;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_strn = 0x6e727473;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_strh = 0x68727473;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_auds = 0x73647561;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_txts = 0x73747874;
-
-  @SuppressWarnings("ConstantCaseForConstants")
-  public static final int FOURCC_vids = 0x73646976;
-
-  /** Parser states. */
-  @Documented
-  @Retention(RetentionPolicy.SOURCE)
-  @Target(TYPE_USE)
-  @IntDef({
-    STATE_SKIPPING_TO_HDRL,
-    STATE_READING_HDRL_HEADER,
-    STATE_READING_HDRL_BODY,
-    STATE_FINDING_MOVI_HEADER,
-    STATE_FINDING_IDX1_HEADER,
-    STATE_READING_IDX1_BODY,
-    STATE_READING_SAMPLES,
-  })
-  private @interface State {}
-
-  private static final int STATE_SKIPPING_TO_HDRL = 0;
-  private static final int STATE_READING_HDRL_HEADER = 1;
-  private static final int STATE_READING_HDRL_BODY = 2;
-  private static final int STATE_FINDING_MOVI_HEADER = 3;
-  private static final int STATE_FINDING_IDX1_HEADER = 4;
-  private static final int STATE_READING_IDX1_BODY = 5;
-  private static final int STATE_READING_SAMPLES = 6;
-
-  private static final int AVIIF_KEYFRAME = 16;
-
-  /**
-   * Flags controlling the behavior of the extractor. Possible flag value is {@link
-   * #FLAG_EMIT_RAW_SUBTITLE_DATA}.
-   */
-  @Documented
-  @Retention(RetentionPolicy.SOURCE)
-  @Target(TYPE_USE)
-  @IntDef(
-      flag = true,
-      value = {FLAG_EMIT_RAW_SUBTITLE_DATA})
-  public @interface Flags {}
-
-  /**
-   * Flag to use the source subtitle formats without modification. If unset, subtitles will be
-   * transcoded to {@link MimeTypes#APPLICATION_MEDIA3_CUES} during extraction.
-   */
-  public static final int FLAG_EMIT_RAW_SUBTITLE_DATA = 1;
-
-  /**
-   * Maximum size to skip using {@link ExtractorInput#skip}. Boxes larger than this size are skipped
-   * using {@link #RESULT_SEEK}.
-   */
-  private static final long RELOAD_MINIMUM_SEEK_DISTANCE = 256 * 1024;
-
-  private final ParsableByteArray scratch;
-  private final ChunkHeaderHolder chunkHeaderHolder;
-  private final boolean parseSubtitlesDuringExtraction;
-  private final SubtitleParser.Factory subtitleParserFactory;
-
-  private @State int state;
-  private ExtractorOutput extractorOutput;
-  private @MonotonicNonNull AviMainHeaderChunk aviHeader;
-  private long durationUs;
-  private ChunkReader[] chunkReaders;
-
-  private long pendingReposition;
-  @Nullable private ChunkReader currentChunkReader;
-  private int hdrlSize;
-  private long moviStart;
-  private long moviEnd;
-  private int idx1BodySize;
-  private boolean seekMapHasBeenOutput;
-
-  /**
-   * @deprecated Use {@link #AviExtractor(int, SubtitleParser.Factory)} instead.
-   */
-  @Deprecated
-  public AviExtractor() {
-    this(FLAG_EMIT_RAW_SUBTITLE_DATA, SubtitleParser.Factory.UNSUPPORTED);
+  static long getUInt(@NonNull ByteBuffer byteBuffer) {
+    return byteBuffer.getInt() & UINT_MASK;
   }
 
-  /**
-   * Constructs an instance.
-   *
-   * @param extractorFlags Flags that control the extractor's behavior.
-   * @param subtitleParserFactory The {@link SubtitleParser.Factory} for parsing subtitles during
-   *     extraction.
-   */
-  public AviExtractor(@Flags int extractorFlags, SubtitleParser.Factory subtitleParserFactory) {
-    this.subtitleParserFactory = subtitleParserFactory;
-    parseSubtitlesDuringExtraction = (extractorFlags & FLAG_EMIT_RAW_SUBTITLE_DATA) == 0;
-    scratch = new ParsableByteArray(/* limit= */ 12);
-    chunkHeaderHolder = new ChunkHeaderHolder();
-    extractorOutput = new NoOpExtractorOutput();
-    chunkReaders = new ChunkReader[0];
-    moviStart = C.INDEX_UNSET;
-    moviEnd = C.INDEX_UNSET;
-    hdrlSize = C.LENGTH_UNSET;
-    durationUs = C.TIME_UNSET;
-  }
-
-  // Extractor implementation.
-
-  @Override
-  public void init(ExtractorOutput output) {
-    this.state = STATE_SKIPPING_TO_HDRL;
-    this.extractorOutput =
-        parseSubtitlesDuringExtraction
-            ? new SubtitleTranscodingExtractorOutput(output, subtitleParserFactory)
-            : output;
-    pendingReposition = C.INDEX_UNSET;
-  }
-
-  @Override
-  public boolean sniff(ExtractorInput input) throws IOException {
-    input.peekFully(scratch.getData(), /* offset= */ 0, /* length= */ 12);
-    scratch.setPosition(0);
-    if (scratch.readLittleEndianInt() != FOURCC_RIFF) {
-      return false;
+  @NonNull
+  static String toString(int tag) {
+    final StringBuilder sb = new StringBuilder(4);
+    for (int i=0;i<4;i++) {
+      sb.append((char)(tag & 0xff));
+      tag >>=8;
     }
-    scratch.skipBytes(4); // Skip the RIFF chunk length.
-    return scratch.readLittleEndianInt() == FOURCC_AVI_;
+    return sb.toString();
   }
 
-  @Override
-  public int read(ExtractorInput input, PositionHolder seekPosition) throws IOException {
-    if (resolvePendingReposition(input, seekPosition)) {
-      return RESULT_SEEK;
-    }
-    switch (state) {
-      case STATE_SKIPPING_TO_HDRL:
-        // Check for RIFF and AVI fourcc's just in case the caller did not sniff, in order to
-        // provide a meaningful error if the input is not an AVI file.
-        if (sniff(input)) {
-          input.skipFully(/* length= */ 12);
-        } else {
-          throw ParserException.createForMalformedContainer(
-              /* message= */ "AVI Header List not found", /* cause= */ null);
-        }
-        state = STATE_READING_HDRL_HEADER;
-        return RESULT_CONTINUE;
-      case STATE_READING_HDRL_HEADER:
-        input.readFully(scratch.getData(), /* offset= */ 0, /* length= */ 12);
-        scratch.setPosition(0);
-        chunkHeaderHolder.populateWithListHeaderFrom(scratch);
-        if (chunkHeaderHolder.listType != FOURCC_hdrl) {
-          throw ParserException.createForMalformedContainer(
-              /* message= */ "hdrl expected, found: " + chunkHeaderHolder.listType,
-              /* cause= */ null);
-        }
-        hdrlSize = chunkHeaderHolder.size;
-        state = STATE_READING_HDRL_BODY;
-        return RESULT_CONTINUE;
-      case STATE_READING_HDRL_BODY:
-        // hdrlSize includes the LIST type (hdrl), so we subtract 4 to the size.
-        int bytesToRead = hdrlSize - 4;
-        ParsableByteArray hdrlBody = new ParsableByteArray(bytesToRead);
-        input.readFully(hdrlBody.getData(), /* offset= */ 0, bytesToRead);
-        parseHdrlBody(hdrlBody);
-        state = STATE_FINDING_MOVI_HEADER;
-        return RESULT_CONTINUE;
-      case STATE_FINDING_MOVI_HEADER:
-        if (moviStart != C.INDEX_UNSET && input.getPosition() != moviStart) {
-          pendingReposition = moviStart;
-          return RESULT_CONTINUE;
-        }
-        input.peekFully(scratch.getData(), /* offset= */ 0, /* length= */ 12);
-        input.resetPeekPosition();
-        scratch.setPosition(0);
-        chunkHeaderHolder.populateFrom(scratch);
-        int listType = scratch.readLittleEndianInt();
-        if (chunkHeaderHolder.chunkType == FOURCC_RIFF) {
-          // We are at the start of the file. The movi chunk is in the RIFF chunk, so we skip the
-          // header, so as to read the RIFF chunk's body.
-          input.skipFully(12);
-          return RESULT_CONTINUE;
-        }
-        if (chunkHeaderHolder.chunkType != FOURCC_LIST || listType != FOURCC_movi) {
-          // The chunk header (8 bytes) plus the whole body.
-          pendingReposition = input.getPosition() + chunkHeaderHolder.size + 8;
-          return RESULT_CONTINUE;
-        }
-        moviStart = input.getPosition();
-        // Size includes the list type, but not the LIST or size fields, so we add 8.
-        moviEnd = moviStart + chunkHeaderHolder.size + 8;
-        if (!seekMapHasBeenOutput) {
-          if (Assertions.checkNotNull(aviHeader).hasIndex()) {
-            state = STATE_FINDING_IDX1_HEADER;
-            pendingReposition = moviEnd;
-            return RESULT_CONTINUE;
-          } else {
-            extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
-            seekMapHasBeenOutput = true;
-          }
-        }
-        // No need to parse the idx1, so we start reading the samples from the movi chunk straight
-        // away. We skip 12 bytes to move to the start of the movi's body.
-        pendingReposition = input.getPosition() + 12;
-        state = STATE_READING_SAMPLES;
-        return RESULT_CONTINUE;
-      case STATE_FINDING_IDX1_HEADER:
-        input.readFully(scratch.getData(), /* offset= */ 0, /* length= */ 8);
-        scratch.setPosition(0);
-        int idx1Fourcc = scratch.readLittleEndianInt();
-        int boxSize = scratch.readLittleEndianInt();
-        if (idx1Fourcc == FOURCC_idx1) {
-          state = STATE_READING_IDX1_BODY;
-          idx1BodySize = boxSize;
-        } else {
-          // This one is not idx1, skip to the next box.
-          pendingReposition = input.getPosition() + boxSize;
-        }
-        return RESULT_CONTINUE;
-      case STATE_READING_IDX1_BODY:
-        ParsableByteArray idx1Body = new ParsableByteArray(idx1BodySize);
-        input.readFully(idx1Body.getData(), /* offset= */ 0, /* length= */ idx1BodySize);
-        parseIdx1Body(idx1Body);
-        state = STATE_READING_SAMPLES;
-        pendingReposition = moviStart;
-        return RESULT_CONTINUE;
-      case STATE_READING_SAMPLES:
-        return readMoviChunks(input);
-      default:
-        throw new AssertionError(); // Should never happen.
-    }
+  @NonNull
+  static ByteBuffer allocate(int bytes) {
+    final byte[] buffer = new byte[bytes];
+    final ByteBuffer byteBuffer = ByteBuffer.wrap(buffer);
+    byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
+    return byteBuffer;
   }
 
-  @Override
-  public void seek(long position, long timeUs) {
-    pendingReposition = C.INDEX_UNSET;
-    currentChunkReader = null;
-    for (ChunkReader chunkReader : chunkReaders) {
-      chunkReader.seekToPosition(position);
-    }
-    if (position == 0) {
-      if (chunkReaders.length == 0) {
-        // Still unprepared.
-        state = STATE_SKIPPING_TO_HDRL;
-      } else {
-        state = STATE_FINDING_MOVI_HEADER;
+  @VisibleForTesting
+  static int getStreamId(int chunkId) {
+    final int upperChar = chunkId & 0xff;
+    if (Character.isDigit(upperChar)) {
+      final int lowerChar = (chunkId >> 8) & 0xff;
+      if (Character.isDigit(upperChar)) {
+        return (lowerChar & 0xf) + ((upperChar & 0xf) * 10);
       }
+    }
+    return -1;
+  }
+
+  static final String TAG = "AviExtractor";
+  @VisibleForTesting
+  static final int PEEK_BYTES = 28;
+
+  static final int AVIIF_KEYFRAME = 16;
+
+
+  static final int RIFF = 0x46464952; // RIFF
+  static final int AVIX_MASK = 0x00ffffff;
+  static final int AVIX = 0x00495641;
+  static final int AVI_ = 0x20495641; // AVI<space>
+  //movie data box
+  static final int MOVI = 0x69766f6d; // movi
+  //Index
+  static final int IDX1 = 0x31786469; // idx1
+
+  static final int JUNK = 0x4b4e554a; // JUNK
+  static final int REC_ = 0x20636572; // rec<space>
+
+  @VisibleForTesting
+  final Deque<IReader> readerStack = new ArrayDeque<>(4);
+  @VisibleForTesting
+  final ArrayList<MoviBox> moviList = new ArrayList<>();
+
+  @VisibleForTesting
+  ExtractorOutput output;
+  /**
+   * From the AviHeader
+   */
+  private long durationUs = C.TIME_UNSET;
+  /**
+   * ChunkHandlers by StreamId
+   */
+  private StreamHandler[] streamHandlers = new StreamHandler[0];
+  @VisibleForTesting
+  SeekMap seekMap;
+
+  @Override
+  public boolean sniff(@NonNull ExtractorInput input) throws IOException {
+    final BoxReader.HeaderPeeker headerPeeker = new BoxReader.HeaderPeeker();
+    headerPeeker.peak(input, BoxReader.PARENT_HEADER_SIZE);
+    return headerPeeker.getChunkId() == RIFF && headerPeeker.getType() == AVI_;
+  }
+
+  /**
+   * Build and set the SeekMap based on the indices
+   */
+  private void buildSeekMap() {
+    long maxStreamDurationUs = 0;
+    for (final StreamHandler streamHandler : streamHandlers) {
+      if (streamHandler instanceof AudioStreamHandler) {
+        if ((streamHandler.getDurationUs() - durationUs) / (float)durationUs > .05f) {
+          w("Audio #" + streamHandler.getId() + " duration is off, using videoDuration");
+          ((AudioStreamHandler)streamHandler).setDurationUs(durationUs);
+        }
+      }
+      maxStreamDurationUs = Math.max(maxStreamDurationUs, streamHandler.getDurationUs());
+    }
+
+    final StreamHandler seekStreamHandler = getSeekStreamHandler();
+    if (seekStreamHandler == null) {
+      setSeekMap(new SeekMap.Unseekable(durationUs));
+      w("No video track found");
       return;
     }
-    state = STATE_READING_SAMPLES;
+    long[] positions = seekStreamHandler.setSeekStream();
+
+    for (StreamHandler streamHandler : streamHandlers) {
+      // Currently, only Audio streams can be secondary.
+      if (streamHandler instanceof AudioStreamHandler && streamHandler != seekStreamHandler) {
+        ((AudioStreamHandler) streamHandler).setSeekFrames(positions);
+      }
+    }
+    // The AviHeader value can have rounding errors, so use the max stream duration if it's larger
+    setSeekMap(new AviSeekMap(Math.max(maxStreamDurationUs, durationUs),
+            seekStreamHandler, moviList.get(0).getStart()));
+  }
+
+  @VisibleForTesting
+  void setSeekMap(SeekMap seekMap) {
+    this.seekMap = seekMap;
+    output.seekMap(seekMap);
+    //Parsing complete, load movi(s)
+    seek(0L, 0L);
+  }
+
+  long getDuration() {
+    return durationUs;
   }
 
   @Override
-  public void release() {
-    // Nothing to release.
+  public void init(@NonNull ExtractorOutput output) {
+    this.output = output;
+    readerStack.add(new RootReader());
   }
 
-  // Internal methods.
-
-  /**
-   * Returns whether a {@link #RESULT_SEEK} is required for the pending reposition. A seek may not
-   * be necessary when the desired position (as held by {@link #pendingReposition}) is after the
-   * {@link ExtractorInput#getPosition() current position}, but not further than {@link
-   * #RELOAD_MINIMUM_SEEK_DISTANCE}.
-   */
-  private boolean resolvePendingReposition(ExtractorInput input, PositionHolder seekPosition)
-      throws IOException {
-    boolean needSeek = false;
-    if (pendingReposition != C.INDEX_UNSET) {
-      long currentPosition = input.getPosition();
-      if (pendingReposition < currentPosition
-          || pendingReposition > currentPosition + RELOAD_MINIMUM_SEEK_DISTANCE) {
-        seekPosition.position = pendingReposition;
-        needSeek = true;
-      } else {
-        // The distance to the target position is short enough that it makes sense to just skip the
-        // bytes, instead of doing a seek which might re-create an HTTP connection.
-        input.skipFully((int) (pendingReposition - currentPosition));
+  @VisibleForTesting
+  StreamHandler buildStreamHandler(final ListBox streamList, int streamId) {
+    final StreamHeaderBox streamHeader = streamList.getChild(StreamHeaderBox.class);
+    final StreamFormatBox streamFormat = streamList.getChild(StreamFormatBox.class);
+    if (streamHeader == null) {
+      w("Missing Stream Header");
+      return null;
+    }
+    //i(streamHeader.toString());
+    if (streamFormat == null) {
+      w("Missing Stream Format");
+      return null;
+    }
+    final long durationUs = streamHeader.getDurationUs();
+    final Format.Builder builder = new Format.Builder();
+    builder.setId(streamId);
+    final int suggestedBufferSize = streamHeader.getSuggestedBufferSize();
+    if (suggestedBufferSize != 0) {
+      builder.setMaxInputSize(suggestedBufferSize);
+    }
+    final StreamNameBox streamName = streamList.getChild(StreamNameBox.class);
+    if (streamName != null) {
+      builder.setLabel(streamName.getName());
+    }
+    final StreamHandler streamHandler;
+    if (streamHeader.isVideo()) {
+      final VideoFormat videoFormat = streamFormat.getVideoFormat();
+      final String mimeType = videoFormat.getMimeType();
+      if (mimeType == null) {
+        Log.w(TAG, "Unknown FourCC: " + toString(videoFormat.getCompression()));
+        return null;
       }
-    }
-    pendingReposition = C.INDEX_UNSET;
-    return needSeek;
-  }
+      final TrackOutput trackOutput = output.track(streamId, C.TRACK_TYPE_VIDEO);
+      builder.setWidth(videoFormat.getWidth());
+      builder.setHeight(videoFormat.getHeight());
+      builder.setFrameRate(streamHeader.getFrameRate());
+      builder.setSampleMimeType(mimeType);
 
-  private void parseHdrlBody(ParsableByteArray hrdlBody) throws IOException {
-    ListChunk headerList = ListChunk.parseFrom(FOURCC_hdrl, hrdlBody);
-    if (headerList.getType() != FOURCC_hdrl) {
-      throw ParserException.createForMalformedContainer(
-          /* message= */ "Unexpected header list type " + headerList.getType(), /* cause= */ null);
-    }
-    @Nullable AviMainHeaderChunk aviHeader = headerList.getChild(AviMainHeaderChunk.class);
-    if (aviHeader == null) {
-      throw ParserException.createForMalformedContainer(
-          /* message= */ "AviHeader not found", /* cause= */ null);
-    }
-    this.aviHeader = aviHeader;
-    // This is usually wrong, so it will be overwritten by video if present
-    durationUs = aviHeader.totalFrames * (long) aviHeader.frameDurationUs;
-    ArrayList<ChunkReader> chunkReaderList = new ArrayList<>();
-    int streamId = 0;
-    for (AviChunk aviChunk : headerList.children) {
-      if (aviChunk.getType() == FOURCC_strl) {
-        ListChunk streamList = (ListChunk) aviChunk;
-        // Note the streamId needs to increment even if the corresponding `strl` is discarded.
-        // See
-        // https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference#avi-stream-headers.
-        @Nullable ChunkReader chunkReader = processStreamList(streamList, streamId++);
-        if (chunkReader != null) {
-          chunkReaderList.add(chunkReader);
+      if (MimeTypes.VIDEO_H264.equals(mimeType)) {
+        streamHandler = new AvcStreamHandler(streamId, durationUs, trackOutput, builder);
+      } else if (MimeTypes.VIDEO_MP4V.equals(mimeType)) {
+        streamHandler = new Mp4VStreamHandler(streamId, durationUs, trackOutput, builder);
+      } else {
+        streamHandler = new VideoStreamHandler(streamId, durationUs, trackOutput);
+      }
+      trackOutput.format(builder.build());
+    } else if (streamHeader.isAudio()) {
+      final AudioFormat audioFormat = streamFormat.getAudioFormat();
+      final TrackOutput trackOutput = output.track(streamId, C.TRACK_TYPE_AUDIO);
+      final String mimeType = audioFormat.getMimeType();
+      builder.setSampleMimeType(mimeType);
+      builder.setChannelCount(audioFormat.getChannels());
+      builder.setSampleRate(audioFormat.getSamplesPerSecond());
+      android.util.Log.d(TAG, "buildStreamHandler: mimeType=" + mimeType);
+      android.util.Log.d(TAG, "buildStreamHandler: audioFormat.getChannels()=" + audioFormat.getChannels());
+      android.util.Log.d(TAG, "buildStreamHandler: audioFormat.getSamplesPerSecond()=" + audioFormat.getSamplesPerSecond());
+      final int bytesPerSecond = audioFormat.getAvgBytesPerSec();
+      android.util.Log.d(TAG, "buildStreamHandler: bytesPerSecond=" + bytesPerSecond);
+      if (bytesPerSecond != 0) {
+        builder.setAverageBitrate(bytesPerSecond * 8);
+      }
+      if (MimeTypes.AUDIO_RAW.equals(mimeType)) {
+        final short bps = audioFormat.getBitsPerSample();
+        if (bps == 8) {
+          builder.setPcmEncoding(C.ENCODING_PCM_8BIT);
+        } else if (bps == 16){
+          builder.setPcmEncoding(C.ENCODING_PCM_16BIT);
         }
       }
-    }
-    chunkReaders = chunkReaderList.toArray(new ChunkReader[0]);
-    extractorOutput.endTracks();
-  }
-
-  /** Builds and outputs the {@link SeekMap} from the idx1 chunk. */
-  private void parseIdx1Body(ParsableByteArray body) {
-    long seekOffset = peekSeekOffset(body);
-    while (body.bytesLeft() >= 16) {
-      int chunkId = body.readLittleEndianInt();
-      int flags = body.readLittleEndianInt();
-      long offset = body.readLittleEndianInt() + seekOffset;
-      body.readLittleEndianInt(); // We ignore the size.
-      ChunkReader chunkReader = getChunkReader(chunkId);
-      if (chunkReader == null) {
-        // We ignore unknown chunk IDs.
-        continue;
+      if ((MimeTypes.AUDIO_AAC.equals(mimeType) || AudioFormat.AUDIO_WMA.equals(mimeType))
+              && audioFormat.getCbSize() > 0) {
+        builder.setInitializationData(Collections.singletonList(audioFormat.getCodecData()));
       }
-      chunkReader.appendIndexChunk(
-          offset, /* isKeyFrame= */ (flags & AVIIF_KEYFRAME) == AVIIF_KEYFRAME);
+      trackOutput.format(builder.build());
+      if (MimeTypes.AUDIO_MPEG.equals(mimeType)) {
+        streamHandler = new MpegAudioStreamHandler(streamId, durationUs, trackOutput,
+            audioFormat.getSamplesPerSecond());
+      } else {
+        streamHandler = new AudioStreamHandler(streamId, durationUs,
+            trackOutput);
+      }
+    }else {
+      streamHandler = null;
     }
-    for (ChunkReader chunkReader : chunkReaders) {
-      chunkReader.compactIndex();
+    if (streamHandler != null) {
+      final IndexBox indexBox = streamList.getChild(IndexBox.class);
+      if (indexBox != null && indexBox.getIndexType() == IndexBox.AVI_INDEX_OF_INDEXES) {
+        streamHandler.setIndexBox(indexBox);
+      }
     }
-    seekMapHasBeenOutput = true;
-    extractorOutput.seekMap(new AviSeekMap(durationUs));
+    return streamHandler;
   }
 
-  private long peekSeekOffset(ParsableByteArray idx1Body) {
-    // The spec states the offset is based on the start of the movi list type fourcc, but it also
-    // says some files base the offset on the start of the file. We use a best effort approach to
-    // figure out which is the case. See:
-    // https://docs.microsoft.com/en-us/previous-versions/windows/desktop/api/Aviriff/ns-aviriff-avioldindex#dwoffset.
-    if (idx1Body.bytesLeft() < 16) {
-      // There are no full entries in the index, meaning we don't need to apply an offset.
-      return 0;
+  @VisibleForTesting
+  StreamHandler getSeekStreamHandler() {
+    if (streamHandlers.length == 0) {
+      return null;
     }
-    int startingPosition = idx1Body.getPosition();
-    idx1Body.skipBytes(8); // Skip chunkId (4 bytes) and flags (4 bytes).
-    int offset = idx1Body.readLittleEndianInt();
 
-    // moviStart poitns at the start of the LIST, while the seek offset is based at the start of the
-    // movi fourCC, so we add 8 to reconcile the difference.
-    long seekOffset = offset > moviStart ? 0L : moviStart + 8;
-    idx1Body.setPosition(startingPosition);
-    return seekOffset;
+    for (StreamHandler streamHandler : streamHandlers) {
+      if (streamHandler instanceof VideoStreamHandler) {
+        return streamHandler;
+      }
+    }
+    //Can't find video? just default to first stream
+    return streamHandlers[0];
+  }
+
+  @NonNull
+  List<IndexBox> getIndexBoxList() {
+    final ArrayList<IndexBox> list = new ArrayList<>();
+    for (StreamHandler streamHandler : streamHandlers) {
+      final IndexBox indexBox = streamHandler.getIndexBox();
+      if (indexBox != null) {
+        list.add(indexBox);
+      }
+    }
+    if (list.size() > 0 && list.size() != streamHandlers.length) {
+      w("StreamHandlers.length != IndexBoxes.length");
+      list.clear();
+    }
+    return list;
+  }
+
+  /**
+   * Reads the index and sets the keyFrames and creates the SeekMap
+   */
+  void parseIdx1(ByteBuffer indexByteBuffer) {
+    if (indexByteBuffer.capacity() < 16) {
+      setSeekMap(new SeekMap.Unseekable(durationUs));
+      w("Index too short");
+      return;
+    }
+    final long firstChunkPos = getFirstChunkPosition();
+    // Specifies the location of the data chunk in the file.
+    // The value should be specified as an offset, in bytes, from the start of the 'movi' list;
+    // however, in some AVI files it is given as an offset from the start of the file.
+    final long baseOffset;
+    if (indexByteBuffer.getInt(8) < firstChunkPos) {
+      // This is offset from the box start not the first chunk, so subtract 'movi'
+      baseOffset = firstChunkPos -4;
+    } else {
+      //Bug: Some muxers use absolute position
+      baseOffset = 0L;
+    }
+
+    while (indexByteBuffer.remaining() >= 16) {
+      final int chunkId = indexByteBuffer.getInt(); //0
+      final int flags = indexByteBuffer.getInt(); //4
+      final int offset = indexByteBuffer.getInt(); //8
+      final int size = indexByteBuffer.getInt(); // 12 Size
+
+      final StreamHandler streamHandler = getStreamHandler(chunkId);
+      if (streamHandler != null) {
+        streamHandler.getChunkIndex().add(baseOffset + (offset & UINT_MASK), size,
+                (flags & AVIIF_KEYFRAME) == AVIIF_KEYFRAME);
+      }
+    }
+    buildSeekMap();
   }
 
   @Nullable
-  private ChunkReader getChunkReader(int chunkId) {
-    for (ChunkReader chunkReader : chunkReaders) {
-      if (chunkReader.handlesChunkId(chunkId)) {
-        return chunkReader;
+  @VisibleForTesting
+  StreamHandler getStreamHandler(int chunkId) {
+    for (StreamHandler streamHandler : streamHandlers) {
+      if (streamHandler.handlesChunkId(chunkId)) {
+        return streamHandler;
       }
     }
     return null;
   }
 
-  private int readMoviChunks(ExtractorInput input) throws IOException {
-    if (input.getPosition() >= moviEnd) {
-      return C.RESULT_END_OF_INPUT;
-    } else if (currentChunkReader != null) {
-      if (currentChunkReader.onChunkData(input)) {
-        currentChunkReader = null;
+  void createStreamHandlers(ListBox headerListBox) {
+    final AviHeaderBox aviHeader = headerListBox.getChild(AviHeaderBox.class);
+    if (aviHeader == null) {
+      throw new IllegalArgumentException("Expected AviHeader in header ListBox");
+    }
+    long totalFrames = aviHeader.getTotalFrames();
+    for (Box box : headerListBox.getChildren()) {
+      if (box instanceof ListBox) {
+        final ListBox listBox = (ListBox) box;
+        if (listBox.getType() == ListBox.TYPE_STRL) {
+          final ListBox streamListBox = (ListBox) box;
+          final int streamId = streamHandlers.length;
+          final StreamHandler streamHandler = buildStreamHandler(streamListBox, streamId);
+          if (streamHandler != null) {
+            streamHandlers = Arrays.copyOf(streamHandlers, streamId + 1);
+            streamHandlers[streamId] = streamHandler;
+          }
+        } else if (listBox.getType() == ListBox.TYPE_ODML) {
+          final ExtendedAviHeader extendedAviHeader = listBox.getChild(ExtendedAviHeader.class);
+          if (extendedAviHeader != null) {
+            totalFrames = extendedAviHeader.getTotalFrames();
+          }
+        }
       }
+    }
+    durationUs = totalFrames * aviHeader.getMicroSecPerFrame();
+    output.endTracks();
+  }
+
+  private int maybeSetPosition(@NonNull ExtractorInput input, @NonNull PositionHolder positionHolder, long position) throws IOException {
+    final long skip = position - input.getPosition();
+    if (skip == 0) {
+      return RESULT_CONTINUE;
+    } else if (skip < 0 || skip > RELOAD_MINIMUM_SEEK_DISTANCE) {
+      positionHolder.position = position;
+      return RESULT_SEEK;
     } else {
-      alignInputToEvenPosition(input);
-      input.peekFully(scratch.getData(), /* offset= */ 0, 12);
-      scratch.setPosition(0);
-      int chunkType = scratch.readLittleEndianInt();
-      if (chunkType == FOURCC_LIST) {
-        scratch.setPosition(8);
-        int listType = scratch.readLittleEndianInt();
-        input.skipFully(listType == FOURCC_movi ? 12 : 8);
-        input.resetPeekPosition();
-        return RESULT_CONTINUE;
+      input.skipFully((int)skip);
+      return RESULT_CONTINUE;
+    }
+  }
+
+  @Override
+  public int read(@NonNull ExtractorInput input, @NonNull PositionHolder positionHolder) throws IOException {
+    final IReader reader = readerStack.peek();
+    if (reader == null) {
+      return RESULT_END_OF_INPUT;
+    }
+    if (reader.getPosition() != input.getPosition()) {
+      final int op = maybeSetPosition(input, positionHolder, reader.getPosition());
+      if (op == RESULT_SEEK) {
+        i("Seek from: " + input.getPosition() + " for " + reader);
       }
-      int size = scratch.readLittleEndianInt();
-      if (chunkType == FOURCC_JUNK) {
-        pendingReposition = input.getPosition() + size + 8;
-        return RESULT_CONTINUE;
-      }
-      input.skipFully(8);
-      input.resetPeekPosition();
-      ChunkReader chunkReader = getChunkReader(chunkType);
-      if (chunkReader == null) {
-        // No handler for this chunk. We skip it.
-        pendingReposition = input.getPosition() + size;
-        return RESULT_CONTINUE;
-      } else {
-        chunkReader.onChunkStart(size);
-        this.currentChunkReader = chunkReader;
+      return op;
+    }
+    if (reader.read(input)) {
+      readerStack.remove(reader);
+      if (reader instanceof Runnable) {
+        ((Runnable) reader).run();
       }
     }
     return RESULT_CONTINUE;
   }
 
-  @Nullable
-  private ChunkReader processStreamList(ListChunk streamList, int streamId) {
-    AviStreamHeaderChunk aviStreamHeaderChunk = streamList.getChild(AviStreamHeaderChunk.class);
-    StreamFormatChunk streamFormatChunk = streamList.getChild(StreamFormatChunk.class);
-    if (aviStreamHeaderChunk == null) {
-      Log.w(TAG, "Missing Stream Header");
-      return null;
+  @Override
+  public void seek(long position, long timeUs) {
+    //i("Seek pos=" + position +", us="+timeUs);
+    if (seekMap == null) {
+      //Until we have the seekMap assume we are still parsing
+      return;
     }
-    if (streamFormatChunk == null) {
-      Log.w(TAG, "Missing Stream Format");
-      return null;
+    readerStack.clear();
+    for (MoviBox moviBox : moviList) {
+      if (moviBox.setPosition(position)) {
+        readerStack.add(moviBox);
+      }
     }
-    long durationUs = aviStreamHeaderChunk.getDurationUs();
-    Format streamFormat = streamFormatChunk.format;
-    Format.Builder builder = streamFormat.buildUpon();
-    builder.setId(streamId);
-    int suggestedBufferSize = aviStreamHeaderChunk.suggestedBufferSize;
-    if (suggestedBufferSize != 0) {
-      builder.setMaxInputSize(suggestedBufferSize);
+    for (@NonNull StreamHandler streamHandler : streamHandlers) {
+      streamHandler.seekPosition(position);
     }
-    StreamNameChunk streamName = streamList.getChild(StreamNameChunk.class);
-    if (streamName != null) {
-      builder.setLabel(streamName.name);
+  }
+
+  @Override
+  public void release() {
+    readerStack.clear();
+    moviList.clear();
+    streamHandlers = new StreamHandler[0];
+  }
+
+  @VisibleForTesting
+  void setChunkHandlers(StreamHandler[] streamHandlers) {
+    this.streamHandlers = streamHandlers;
+  }
+
+  private static void w(String message) {
+    Log.w(TAG, message);
+  }
+
+  private static void i(String message) {
+    Log.i(TAG, message);
+  }
+
+  /**
+   * Queue the IReader to run next
+   * @param reader If the reader is Runnable, it will be run on completion
+   */
+  public void push(IReader reader) {
+    readerStack.push(reader);
+  }
+
+  /**
+   * Add a MoviBox to the list
+   */
+  void addMovi(@NonNull MoviBox moviBox) {
+    moviList.add(moviBox);
+  }
+
+  /**
+   * Get the position of first chunk
+   */
+  long getFirstChunkPosition() {
+    return moviList.get(0).getStart();
+  }
+
+  class RootReader extends BoxReader implements Runnable {
+    private long size = Long.MIN_VALUE;
+
+    RootReader() {
+      super(0L, -1);
     }
-    int trackType = MimeTypes.getTrackType(streamFormat.sampleMimeType);
-    if (trackType == C.TRACK_TYPE_AUDIO || trackType == C.TRACK_TYPE_VIDEO) {
-      TrackOutput trackOutput = extractorOutput.track(streamId, trackType);
-      trackOutput.format(builder.build());
-      trackOutput.durationUs(durationUs);
-      ChunkReader chunkReader =
-          new ChunkReader(
-              streamId, trackType, durationUs, aviStreamHeaderChunk.length, trackOutput);
-      this.durationUs = max(this.durationUs, durationUs);
-      return chunkReader;
-    } else {
-      // We don't currently support tracks other than video and audio.
-      return null;
+
+    @Override
+    public long getSize() {
+      return size;
+    }
+
+    @Override
+    protected long getEnd() {
+      return size;
+    }
+
+    @Nullable
+    private RiffReader riffReader;
+
+    @Override
+    protected boolean isComplete() {
+      return super.isComplete() && (riffReader == null || riffReader.isComplete());
+    }
+
+    @Override
+    public boolean read(@NonNull ExtractorInput input) throws IOException {
+      if (size == Long.MIN_VALUE) {
+        size = input.getLength();
+      }
+      if (isComplete()) {
+        return true;
+      }
+      final int chunkId;
+      if (headerPeeker.peakSafe(input)) {
+        chunkId = headerPeeker.getChunkId();
+      } else {
+        return true;
+      }
+      if (chunkId != RIFF) {
+        throw new IOException("Expected RIFF");
+      }
+      final int type = headerPeeker.getType();
+      if ((type & AVIX_MASK) != AVIX) {
+        throw new IOException("Expected AVI?");
+      }
+      riffReader = new RiffReader(position + PARENT_HEADER_SIZE, headerPeeker.getSize() - 4, type);
+      push(riffReader);
+      return advancePosition(CHUNK_HEADER_SIZE + headerPeeker.getSize());
+    }
+
+    @Override
+    public void run() {
+      //After the last RiffBox finishes process the OpenDML indexes
+      final List<IndexBox> indexBoxList = getIndexBoxList();
+      if (!indexBoxList.isEmpty()) {
+        final List<Long> list = new ArrayList<>();
+        for (IndexBox indexBox : indexBoxList) {
+          list.addAll(indexBox.getPositions());
+        }
+        readerStack.push(new IdxxBox(list));
+      }
+    }
+  }
+
+  class RiffReader extends BoxReader {
+    private final int riffType;
+    public RiffReader(long start, int size, int type) {
+      super(start, size);
+      this.riffType = type;
+    }
+
+    @Override
+    public boolean read(@NonNull ExtractorInput input) throws IOException {
+      final int chunkId = headerPeeker.peak(input, CHUNK_HEADER_SIZE);
+      final int size = headerPeeker.getSize();
+      switch (chunkId) {
+        case ListBox.LIST:
+          final int type = headerPeeker.peakType(input);
+          if (type == MOVI) {
+            addMovi(new MoviBox(position + PARENT_HEADER_SIZE, size - 4));
+            if (riffType == AVIX || getIndexBoxList().size() > 0) {
+              //If we have OpenDML Indexes exit early and skip the IDX1 Index
+              position = getEnd();
+              return true;
+            }
+          } else if (type == ListBox.TYPE_HDRL){
+            readerStack.push(new HeaderListBox(position + PARENT_HEADER_SIZE, size - 4, readerStack));
+          }
+          break;
+        case IDX1: {
+          final ByteBuffer byteBuffer = getByteBuffer(input, size);
+          parseIdx1(byteBuffer);
+        }
+      }
+      return advancePosition();
     }
   }
 
   /**
-   * Skips one byte from the given {@code input} if the current position is odd.
-   *
-   * <p>This isn't documented anywhere, but AVI files are aligned to even bytes and fill gaps with
-   * zeros.
+   * Box of stream chunks
    */
-  private static void alignInputToEvenPosition(ExtractorInput input) throws IOException {
-    if ((input.getPosition() & 1) == 1) {
-      input.skipFully(1);
-    }
-  }
-
-  // Internal classes.
-
-  private class AviSeekMap implements SeekMap {
-
-    private final long durationUs;
-
-    public AviSeekMap(long durationUs) {
-      this.durationUs = durationUs;
+  class MoviBox extends BoxReader {
+    MoviBox(long start, int size) {
+      super(start, size);
     }
 
-    @Override
-    public boolean isSeekable() {
+    /**
+     * Prepares the MoviBox to be added to the readerQueue
+     * @param position will be set to {@link #getStart()}
+     * @return false if position after end (don't  use)
+     */
+    public boolean setPosition(long position) {
+      if (position > getEnd()) {
+        return false;
+      }
+      this.position = Math.max(getStart(), position);
       return true;
     }
 
     @Override
-    public long getDurationUs() {
-      return durationUs;
-    }
-
-    @Override
-    public SeekPoints getSeekPoints(long timeUs) {
-      SeekPoints result = chunkReaders[0].getSeekPoints(timeUs);
-      for (int i = 1; i < chunkReaders.length; i++) {
-        SeekPoints seekPoints = chunkReaders[i].getSeekPoints(timeUs);
-        if (seekPoints.first.position < result.first.position) {
-          result = seekPoints;
+    public boolean read(@NonNull ExtractorInput input) throws IOException {
+      final int chunkId = headerPeeker.peak(input, CHUNK_HEADER_SIZE);
+      final StreamHandler streamHandler = getStreamHandler(chunkId);
+      if (streamHandler != null) {
+        streamHandler.setRead(position + CHUNK_HEADER_SIZE, headerPeeker.getSize());
+        push(streamHandler);
+      } else if (chunkId == ListBox.LIST) {
+        final int type = headerPeeker.peakType(input);
+        if (type == REC_) {
+          return advancePosition(PARENT_HEADER_SIZE);
         }
       }
-      return result;
+      return advancePosition();
     }
   }
 
-  private static class ChunkHeaderHolder {
-    public int chunkType;
-    public int size;
-    public int listType;
+  class IdxxBox implements IReader {
+    private final ArrayDeque<Long> deque;
 
-    public void populateWithListHeaderFrom(ParsableByteArray headerBytes) throws ParserException {
-      populateFrom(headerBytes);
-      if (chunkType != AviExtractor.FOURCC_LIST) {
-        throw ParserException.createForMalformedContainer(
-            /* message= */ "LIST expected, found: " + chunkType, /* cause= */ null);
-      }
-      listType = headerBytes.readLittleEndianInt();
+    IdxxBox(List<Long> positionList) {
+      Collections.sort(positionList);
+      deque = new ArrayDeque<>(positionList);
     }
 
-    public void populateFrom(ParsableByteArray headerBytes) {
-      chunkType = headerBytes.readLittleEndianInt();
-      size = headerBytes.readLittleEndianInt();
-      listType = 0;
+    @Override
+    public long getPosition() {
+      return deque.peekFirst();
+    }
+
+    @Override
+    public boolean read(@NonNull ExtractorInput input) throws IOException {
+      final BoxReader.HeaderPeeker headerPeeker = new BoxReader.HeaderPeeker();
+      headerPeeker.peak(input, BoxReader.CHUNK_HEADER_SIZE);
+      ByteBuffer byteBuffer = BoxReader.getByteBuffer(input, headerPeeker.getSize());
+      deque.pop();
+      byteBuffer.position(byteBuffer.position() + 2); //Skip longs per entry
+      final byte indexSubType = byteBuffer.get();
+      if (indexSubType != 0) {
+        throw new IllegalArgumentException("Expected IndexSubType 0 got " + indexSubType);
+      }
+      final byte indexType = byteBuffer.get();
+      if (indexType != IndexBox.AVI_INDEX_OF_CHUNKS) {
+        throw new IllegalArgumentException("Expected IndexType 1 got " + indexType);
+      }
+      final int entriesInUse = byteBuffer.getInt();
+      final int chunkId = byteBuffer.getInt();
+      final StreamHandler streamHandler = getStreamHandler(chunkId);
+      if (streamHandler == null) {
+        w("No StreamHandler for " + AviExtractor.toString(chunkId));
+      } else {
+        final ChunkIndex chunkIndex = streamHandler.getChunkIndex();
+        //baseOffset does not include the chunk header, so -8 to be compatible with IDX1
+        final long baseOffset = byteBuffer.getLong() - 8;
+        byteBuffer.position(byteBuffer.position() + 4); // Skip reserved
+
+        for (int i=0;i<entriesInUse;i++) {
+          final int offset = byteBuffer.getInt();
+          final int size = byteBuffer.getInt();
+          final int size31 = size & 0x7f_ff_ff_ff;
+          chunkIndex.add(baseOffset + (offset & AviExtractor.UINT_MASK), size31,
+                  size == size31);
+        }
+      }
+      if (!deque.isEmpty()) {
+        return false;
+      }
+      buildSeekMap();
+      return true;
+    }
+    @Override
+    public String toString() {
+      return "IdxxBox{positions=" + deque +
+              "}";
+    }
+  }
+
+  class HeaderListBox extends ListBox implements Runnable {
+    public HeaderListBox(long position, int size, @NonNull Deque<IReader> readerStack) {
+      super(position, size, ListBox.TYPE_HDRL, readerStack);
+    }
+
+    @Override
+    public void run() {
+      createStreamHandlers(this);
     }
   }
 }
